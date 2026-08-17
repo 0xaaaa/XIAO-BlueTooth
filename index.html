@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>XIAO 录音笔 - 文件传输</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --line:#2a2f3a; --fg:#e8eaf0; --mut:#8b93a5; --acc:#4f8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  .wrap { max-width:640px; margin:0 auto; padding:20px 16px 60px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--mut); font-size:13px; margin-bottom:20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
+  button { background:var(--acc); color:#fff; border:0; border-radius:8px; padding:10px 16px; font-size:14px; cursor:pointer; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg); }
+  input { background:#0d0f13; border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:10px; font-size:15px; width:120px; text-align:center; letter-spacing:2px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .status { color:var(--mut); font-size:13px; margin-top:10px; min-height:18px; }
+  .file { display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  .file .progress { flex-basis:100%; margin-top:6px; }
+  .file:last-child { border-bottom:0; }
+  .fname { flex:1; font-size:14px; }
+  .fsize { color:var(--mut); font-size:12px; }
+  .badge { font-size:11px; padding:2px 8px; border-radius:20px; }
+  .synced { background:#123b2a; color:#4ade80; }
+  .newsyn { background:#3a2a12; color:#fbbf24; }
+  .progress { height:6px; background:var(--line); border-radius:3px; overflow:hidden; margin-top:8px; }
+  .progress > div { height:100%; background:var(--acc); width:0; transition:width .2s; }
+  audio { width:100%; margin-top:12px; }
+  .muted { color:var(--mut); font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>XIAO 录音笔</h1>
+  <div class="sub">Web Bluetooth · 连接后认证、授时、下载录音</div>
+
+  <div class="card">
+    <div class="row">
+      <button id="btnConnect">连接设备</button>
+      <button id="btnDisconnect" class="ghost" disabled>断开</button>
+    </div>
+    <div class="status" id="connStatus">未连接</div>
+  </div>
+
+  <div class="card" id="authCard" style="display:none">
+    <div class="row">
+      <input id="pin" maxlength="6" value="123456" inputmode="numeric" />
+      <button id="btnAuth">验证 PIN</button>
+    </div>
+    <div class="status" id="authStatus">输入 6 位 PIN 后验证</div>
+  </div>
+
+  <div class="card" id="infoCard" style="display:none">
+    <strong>设备状态</strong>
+    <div class="status" id="infoText">—</div>
+  </div>
+
+  <div class="card" id="filesCard" style="display:none">
+    <div class="row" style="justify-content:space-between">
+      <strong>录音列表</strong>
+      <div class="row">
+        <button id="btnDownloadAll" class="ghost">全部下载</button>
+        <button id="btnRefresh" class="ghost">刷新</button>
+      </div>
+    </div>
+    <div class="muted" id="meta"></div>
+    <div id="fileList"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const SERVICE = "12345678-1234-1234-1234-123456789abc";
+const CMD    = "12345678-1234-1234-1234-123456789abd";
+const DATA   = "12345678-1234-1234-1234-123456789abe";
+
+let device = null, server = null, service = null, cmdChar = null, dataChar = null;
+let authed = false;
+
+const $ = id => document.getElementById(id);
+const enc = s => new TextEncoder().encode(s);
+const u32 = (a, o) => (a[o] | (a[o+1] << 8) | (a[o+2] << 16) | (a[o+3] << 24)) >>> 0;
+
+const stepTable = [
+  7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,
+  107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,
+  796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,
+  4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,15289,
+  16818,18500,20350,22385,24623,27086,29794,32767
+];
+const indexTable = [-1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8];
+
+function decodeAdpcm(bytes) {
+  let prev = 0, idx = 0;
+  const out = new Int16Array(bytes.length * 2);
+  let o = 0;
+  const nib = code => {
+    const step = stepTable[idx];
+    let dq = step >> 3;
+    if (code & 4) dq += step;
+    if (code & 2) dq += step >> 1;
+    if (code & 1) dq += step >> 2;
+    if (code & 8) prev -= dq; else prev += dq;
+    if (prev > 32767) prev = 32767; else if (prev < -32768) prev = -32768;
+    idx += indexTable[code];
+    if (idx < 0) idx = 0; else if (idx > 88) idx = 88;
+    return prev;
+  };
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    out[o++] = nib(b & 0x0F);
+    out[o++] = nib((b >> 4) & 0x0F);
+  }
+  return out;
+}
+
+function pcmToWav(samples, rate) {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const w = (o, s) => { for (let i=0;i<s.length;i++) v.setUint8(o+i, s.charCodeAt(i)); };
+  w(0,"RIFF"); v.setUint32(4, 36 + samples.length*2, true); w(8,"WAVE");
+  w(12,"fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate*2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36,"data"); v.setUint32(40, samples.length*2, true);
+  for (let i=0;i<samples.length;i++) v.setInt16(44+i*2, samples[i], true);
+  return buf;
+}
+
+function crc16(bytes) {
+  let crc = 0xFFFF;
+  for (let i=0;i<bytes.length;i++) {
+    crc ^= bytes[i] << 8;
+    for (let k=0;k<8;k++) crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+    crc &= 0xFFFF;
+  }
+  return crc;
+}
+
+function fmtSize(n) {
+  if (n >= 1048576) return (n/1048576).toFixed(1) + " MB";
+  if (n >= 1024) return (n/1024).toFixed(0) + " KB";
+  return n + " B";
+}
+
+function fmtTs(ts) {
+  if (!ts) return "时间未知";
+  const d = new Date(ts * 1000);
+  const p = x => String(x).padStart(2,"0");
+  return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+async function writeCmd(bytes) {
+  await cmdChar.writeValueWithResponse(bytes);
+}
+
+/* ---- 通知状态机 ---- */
+let listEntries = [];
+let dlQueue = [];   // 待下载队列
+let dl = null;      // 当前下载 { entry, data, ranges, rangeBase, rangeLen, rangeQueue, rangeTries }
+let lastProg = 0;   // 进度刷新节流
+let savedBlobs = {};   // index -> {url, dur} 已下载音频, 刷新列表后仍可播放
+let prevState = -1;    // 设备状态跟踪: 用于录音计时和列表自动刷新
+let recSince = 0;
+
+// 合并已接收的字节区间, 计算覆盖字节数
+function mergeRanges(arr) {
+  if (!arr.length) return [];
+  arr.sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const r of arr) {
+    const last = out[out.length - 1];
+    if (last && r[0] <= last[1]) { if (r[1] > last[1]) last[1] = r[1]; }
+    else out.push([r[0], r[1]]);
+  }
+  return out;
+}
+
+function coveredBytes(arr) {
+  let n = 0;
+  for (const r of arr) n += r[1] - r[0];
+  return n;
+}
+
+function rowFor(idx) { return document.querySelector(`[data-idx="${idx}"]`); }
+
+function setRowStatus(idx, text) {
+  const row = rowFor(idx);
+  if (row) { const st = row.querySelector(".rowstatus"); if (st) st.textContent = text; }
+}
+
+function setRowProgress(idx, pct, text) {
+  const row = rowFor(idx);
+  if (!row) return;
+  const bar = row.querySelector(".progress > div");
+  if (bar) bar.style.width = pct + "%";
+  const st = row.querySelector(".rowstatus");
+  if (st) st.textContent = text;
+}
+
+function onNotify(ev) {
+  const val = new Uint8Array(ev.target.value.buffer);
+  const t = val[0];
+  if (t === 0x41) { // 'A'
+    const ok = val[1] === 1;
+    authed = ok;
+    $("authStatus").textContent = ok ? "验证成功 ✓" : "PIN 错误";
+    if (ok) { $("filesCard").style.display = ""; $("infoCard").style.display = ""; refreshList(); }
+  }
+  else if (t === 0x49) { // 'I' 设备信息
+    const ts = u32(val, 1);
+    const batt = val[6], hr = val[8], spo2 = val[9];
+    const states = ["待机", "录音中", "保存中", "列表"];
+    const st = val[12] || 0;
+    const d = new Date(ts * 1000);
+    const p = x => String(x).padStart(2, "0");
+    const timeStr = ts ? `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}` : "未授时";
+    let recStr = "";
+    if (st === 1) {
+      if (prevState !== 1) recSince = Date.now();
+      recStr = ` ${Math.floor((Date.now() - recSince) / 1000)}s`;
+    }
+    $("infoText").textContent =
+      `🕐 ${timeStr} · 🔋 ${batt}% · ❤ ${hr || "--"} · 🩸 ${spo2 || "--"} · ${states[st] || ""}${recStr}`;
+    // 进入列表状态时自动刷新文件列表 (无需手点刷新)
+    if (st === 3 && prevState !== 3 && !dl) refreshList();
+    prevState = st;
+  }
+  else if (t === 0x4E) { // 'N' 文件条目
+    const idx = val[9]|(val[10]<<8);
+    if (listEntries.some(e => e.index === idx)) return;   // 去重(两次刷新交错时)
+    listEntries.push({ ts: u32(val,1), size: u32(val,5), index: idx, synced: val[11], crc: val[12]|(val[13]<<8) });
+  }
+  else if (t === 0x45) { // 'E' 列表结束
+    const count = val[1]|(val[2]<<8);
+    const free = u32(val, 3);
+    $("meta").textContent = `共 ${count} 条 · 剩余 ${fmtSize(free)}`;
+    renderList();
+  }
+  else if (t === 0x46) { // 'F' 数据块 (带文件内偏移)
+    if (dl) {
+      const off = u32(val, 1);
+      const len = val.length - 5;
+      for (let i = 0; i < len; i++) dl.data[off + i] = val[5 + i];
+      dl.ranges.push([off, off + len]);
+      const nw = Date.now();
+      if (nw - lastProg > 100) {          // 每100ms刷一次进度
+        lastProg = nw;
+        const covered = coveredBytes(mergeRanges(dl.ranges));
+        setRowProgress(dl.entry.index, covered / dl.entry.size * 100, `${fmtSize(covered)} / ${fmtSize(dl.entry.size)}`);
+      }
+    }
+  }
+  else if (t === 0x58) { // 'X' 当前范围发送完毕
+    onRangeDone();
+  }
+  else if (t === 0x51) { // 'Q' 错误
+    const code = val[1];
+    if (dl) {
+      const msg = code === 2 ? "错误: 未认证"
+                : code === 3 ? "录音中, 停止后再试"
+                : "错误: 文件不存在";
+      setRowStatus(dl.entry.index, msg);
+    }
+    dl = null;
+    if (code !== 3) pumpQueue();   // 录音中不自动重试, 等停止后手动再点下载
+  }
+  else if (t === 0x54) { // 'T' 时间 ack
+    $("connStatus").textContent = "已连接 · 时间已同步";
+  }
+  else if (t === 0x53) { // 'S' 同步 ack
+    const idx = val[1]|(val[2]<<8);
+    const e = listEntries.find(e => e.index === idx);
+    if (e) e.synced = 1;
+    renderList();
+  }
+  else if (t === 0x52) { // 'R' 删除 ack
+    const idx = val[1];
+    const ok = val[2];
+    if (ok) {
+      listEntries = listEntries.filter(x => x.index !== idx);
+      dlQueue = dlQueue.filter(x => x.index !== idx);
+      if (savedBlobs[idx]) { URL.revokeObjectURL(savedBlobs[idx].url); delete savedBlobs[idx]; }
+      renderList();
+    }
+  }
+}
+
+function renderList() {
+  const div = $("fileList");
+  div.innerHTML = "";
+  if (!listEntries.length) { div.innerHTML = '<div class="muted">暂无录音</div>'; return; }
+  const sorted = [...listEntries].sort((a,b) => b.ts - a.ts);
+  for (const e of sorted) {
+    const row = document.createElement("div");
+    row.className = "file";
+    row.dataset.idx = e.index;
+    row.innerHTML =
+      `<div class="fname">${fmtTs(e.ts)}</div>
+       <div class="fsize">${fmtSize(e.size)}</div>
+       <span class="badge ${e.synced ? 'synced' : 'newsyn'}">${e.synced ? '已同步' : '未同步'}</span>`;
+    const b = document.createElement("button");
+    b.className = "ghost"; b.textContent = "下载";
+    b.onclick = () => queueDownload(e);
+    row.appendChild(b);
+    const saved = savedBlobs[e.index];
+    if (saved) {
+      const pb = document.createElement("button");
+      pb.className = "ghost";
+      pb.textContent = "播放";
+      pb.onclick = () => { new Audio(saved.url).play(); };
+      row.appendChild(pb);
+    }
+    const dbtn = document.createElement("button");
+    dbtn.className = "ghost"; dbtn.textContent = "删除";
+    dbtn.onclick = () => deleteEntry(e);
+    row.appendChild(dbtn);
+    const prog = document.createElement("div");
+    prog.className = "progress";
+    prog.innerHTML = "<div></div>";
+    prog.style.display = "none";
+    row.appendChild(prog);
+    const st = document.createElement("div");
+    st.className = "rowstatus muted";
+    st.style.flexBasis = "100%";
+    row.appendChild(st);
+    div.appendChild(row);
+    if (saved) setRowStatus(e.index, `已下载 · ${saved.dur.toFixed(1)}s · 刷新后仍可播放`);
+  }
+}
+
+// 一个范围发完: 等250ms让在途通知全部落地, 再找缺口逐个重新请求
+function onRangeDone() {
+  if (!dl || dl.xPending) return;
+  dl.xPending = true;
+  setTimeout(() => {
+    dl.xPending = false;
+    if (!dl) return;
+    dl.ranges = mergeRanges(dl.ranges);
+    let pos = dl.rangeBase;
+    const gaps = [];
+    for (const r of dl.ranges) {
+      if (r[0] > pos) gaps.push([pos, r[0]]);
+      if (r[1] > pos) pos = r[1];
+    }
+    if (pos < dl.rangeBase + dl.rangeLen) gaps.push([pos, dl.rangeBase + dl.rangeLen]);
+    for (const g of gaps) if (g[1] > g[0]) dl.rangeQueue.push({ start: g[0], len: g[1] - g[0] });
+    if (gaps.length) console.log("检测到缺口:", JSON.stringify(gaps));
+    nextRangeOrFinish();
+  }, 250);
+}
+
+function nextRangeOrFinish() {
+  if (!dl || dl.gPending) return;
+  if (dl.rangeQueue.length && dl.rangeTries < 25) {   // 缺口重传
+    const r = dl.rangeQueue.shift();
+    dl.rangeBase = r.start;
+    dl.rangeLen = r.len;
+    dl.rangeTries++;
+    const c = new Uint8Array(11);
+    c[0] = 0x47;  // 'G' 按范围重传
+    c[1] = dl.entry.index & 0xFF; c[2] = (dl.entry.index >> 8) & 0xFF;
+    c[3] = r.start & 0xFF; c[4] = (r.start >> 8) & 0xFF; c[5] = (r.start >> 16) & 0xFF; c[6] = (r.start >>> 24) & 0xFF;
+    c[7] = r.len & 0xFF; c[8] = (r.len >> 8) & 0xFF; c[9] = (r.len >> 16) & 0xFF; c[10] = (r.len >>> 24) & 0xFF;
+    dl.gPending = true;
+    setTimeout(() => {             // 稍等100ms再发, 避免与设备侧'X'重发撞车
+      dl.gPending = false;
+      if (dl) writeCmd(c).catch(() => {});
+    }, 100);
+    return;
+  }
+  // 所有范围处理完毕
+  dl.ranges = mergeRanges(dl.ranges);
+  const covered = coveredBytes(dl.ranges);
+  finalizeDownload(covered);
+}
+
+// 全部范围完成: 校验 -> 解码 -> 自动标记同步 -> 下一个
+function finalizeDownload(covered) {
+  if (!dl) return;
+  const entry = dl.entry;
+  const data = dl.data;
+  if (covered !== entry.size) {
+    // 打印缺失区间, 便于定位丢包位置
+    const miss = [];
+    let p = 0;
+    for (const r of dl.ranges) { if (r[0] > p) miss.push([p, r[0]]); if (r[1] > p) p = r[1]; }
+    if (p < entry.size) miss.push([p, entry.size]);
+    console.log("缺失区间:", JSON.stringify(miss));
+    setRowStatus(entry.index, `数据不完整 (收到 ${covered} / 应 ${entry.size})`);
+    dl = null; pumpQueue(); return;
+  }
+  if (crc16(data) !== entry.crc) {
+    setRowStatus(entry.index, "CRC 校验失败");
+    dl = null; pumpQueue(); return;
+  }
+  const samples = decodeAdpcm(data);
+  const wav = pcmToWav(samples, 16000);
+  const url = URL.createObjectURL(new Blob([wav], {type:"audio/wav"}));
+  savedBlobs[entry.index] = { url, dur: samples.length / 16000 };
+  entry.synced = 1;
+  const s = new Uint8Array(3);              // 下载完成自动标记同步
+  s[0] = 0x53; s[1] = entry.index & 0xFF; s[2] = (entry.index >> 8) & 0xFF;
+  writeCmd(s).catch(() => {});
+  dl = null;
+  renderList();
+  pumpQueue();
+}
+
+async function pumpQueue() {
+  if (dl || !dlQueue.length) return;
+  const entry = dlQueue.shift();
+  dl = {
+    entry, data: new Uint8Array(entry.size),
+    ranges: [], rangeBase: 0, rangeLen: entry.size,
+    rangeQueue: [], rangeTries: 0,
+    xPending: false, gPending: false
+  };
+  const row = rowFor(entry.index);
+  if (row) { const bar = row.querySelector(".progress"); if (bar) bar.style.display = ""; }
+  setRowProgress(entry.index, 0, "准备…");
+  const c = new Uint8Array(3);
+  c[0] = 0x44; c[1] = entry.index & 0xFF; c[2] = (entry.index >> 8) & 0xFF;
+  await writeCmd(c);
+}
+
+function queueDownload(e) {
+  if (dl && dl.entry.index === e.index) return;             // 正在下载
+  if (dlQueue.some(x => x.index === e.index)) return;       // 已在队列
+  dlQueue.push(e);
+  setRowStatus(e.index, "排队中…");
+  pumpQueue();
+}
+
+async function refreshList() {
+  if (!authed) return;
+  listEntries = [];
+  $("fileList").innerHTML = '<div class="muted">加载中…</div>';
+  await writeCmd(enc("L"));
+}
+
+async function deleteEntry(e) {
+  if (!confirm(`删除 ${fmtTs(e.ts)} 这条录音?`)) return;
+  const c = new Uint8Array(3);
+  c[0] = 0x52; c[1] = e.index & 0xFF; c[2] = (e.index >> 8) & 0xFF;
+  await writeCmd(c);
+}
+
+$("btnConnect").onclick = async () => {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE] }],
+      optionalServices: [SERVICE]
+    });
+    device.addEventListener("gattserverdisconnected", onDeviceDisconnected);
+    await connectGatt();
+  } catch (e) {
+    $("connStatus").textContent = "连接失败: " + e.message;
+  }
+};
+
+async function connectGatt() {
+  // 最多尝试 3 次: 部分安卓机型连接后立即断开, 重试可恢复
+  let lastErr = null;
+  for (let i = 0; i < 3; i++) {
+    try {
+      server = await device.gatt.connect();
+      // 等 GATT 稳定后再发现服务 (部分安卓机型需要)
+      await new Promise(r => setTimeout(r, 500));
+      service = await server.getPrimaryService(SERVICE);
+      cmdChar = await service.getCharacteristic(CMD);
+      dataChar = await service.getCharacteristic(DATA);
+      await dataChar.startNotifications();
+      dataChar.addEventListener("characteristicvaluechanged", onNotify);
+      $("connStatus").textContent = "已连接: " + (device.name || "未知设备");
+      $("btnConnect").disabled = true;
+      $("btnDisconnect").disabled = false;
+      $("authCard").style.display = "";
+      // 连接即授时(无需PIN), 保证之后录制的文件时间戳准确
+      try {
+        const utc = Math.floor(Date.now() / 1000);
+        const tz = -new Date().getTimezoneOffset() / 60;
+        const t = new Uint8Array(6);
+        t[0] = 0x54;
+        t[1] = utc & 0xFF; t[2] = (utc >> 8) & 0xFF; t[3] = (utc >> 16) & 0xFF; t[4] = (utc >>> 24) & 0xFF;
+        t[5] = tz & 0xFF;
+        await cmdChar.writeValueWithResponse(t);
+      } catch (e) {}
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (!device.gatt.connected) { $("connStatus").textContent = `连接断开, 重试 ${i + 1}/3…`; }
+      else { $("connStatus").textContent = "连接失败: " + e.message; return; }
+    }
+  }
+  throw lastErr;
+}
+
+function onDeviceDisconnected() {
+  authed = false;
+  dl = null;
+  dlQueue = [];
+  $("connStatus").textContent = "连接已断开, 请重新连接";
+  $("btnConnect").disabled = false;
+  $("btnDisconnect").disabled = true;
+  $("authCard").style.display = "none";
+  $("filesCard").style.display = "none";
+  $("infoCard").style.display = "none";
+  server = service = cmdChar = dataChar = null;
+}
+
+$("btnDisconnect").onclick = () => {
+  if (server) server.disconnect();
+  device = server = service = cmdChar = dataChar = null;
+  authed = false;
+  dl = null;
+  dlQueue = [];
+  $("connStatus").textContent = "已断开";
+  $("btnConnect").disabled = false;
+  $("btnDisconnect").disabled = true;
+  $("authCard").style.display = "none";
+  $("filesCard").style.display = "none";
+  $("infoCard").style.display = "none";
+};
+
+$("btnAuth").onclick = async () => {
+  const pin = $("pin").value.trim();
+  if (pin.length !== 6) { $("authStatus").textContent = "请输入 6 位 PIN"; return; }
+  try {
+    await writeCmd(enc("P" + pin));
+    // 同时授时: 'T' + UTC(4) + tz(1)
+    const utc = Math.floor(Date.now() / 1000);
+    const tz = -new Date().getTimezoneOffset() / 60;
+    const t = new Uint8Array(6);
+    t[0] = 0x54;
+    t[1] = utc & 0xFF; t[2] = (utc >> 8) & 0xFF; t[3] = (utc >> 16) & 0xFF; t[4] = (utc >>> 24) & 0xFF;
+    t[5] = tz & 0xFF;
+    await writeCmd(t);
+  } catch (e) {
+    $("authStatus").textContent = "发送失败: " + e.message;
+  }
+};
+
+$("btnRefresh").onclick = refreshList;
+
+$("btnDownloadAll").onclick = () => {
+  if (!authed || !listEntries.length) return;
+  const sorted = [...listEntries].sort((a,b) => b.ts - a.ts);
+  for (const e of sorted) queueDownload(e);
+};
+</script>
+</body>
+</html>
